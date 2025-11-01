@@ -51,7 +51,8 @@ def run(args):
         return 0.5 * (1 + math.cos(math.pi * p))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     lm_path = args.lm_path if os.path.exists(args.lm_path) else ("lm/english.arpa" if os.path.exists("lm/english.arpa") else None)
-    lm = ExternalLM(path=lm_path, alpha=args.lm_alpha, beta=args.lm_beta) if (args.beam and args.use_lm and lm_path) else None
+    lm = ExternalLM(path="lm/english.arpa", alpha=0.6, beta=1.0)
+
     best_val = 1e9
     hist = {"train_loss": [], "val_loss": [], "wer": [], "cer": []}
     t0 = time.time()
