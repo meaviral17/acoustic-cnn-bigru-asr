@@ -1,7 +1,14 @@
 import torch, random, numpy as np, torchaudio
 from torch.utils.data import Dataset
 from torchaudio.datasets import LIBRISPEECH
-from torchaudio.transforms import MelSpectrogram, AmplitudeToDB, FrequencyMasking, TimeMasking, PCEN
+from torchaudio.transforms import MelSpectrogram, AmplitudeToDB, FrequencyMasking, TimeMasking
+
+try:
+    from torchaudio.transforms import PCEN
+    HAS_PCEN = True
+except ImportError:
+    HAS_PCEN = False
+
 
 class LibriCTCDataset(Dataset):
     def __init__(self, root, url, tokenizer, sample_rate=16000, n_mels=80, pcen=False, specaug=True, tf_mixup=False, max_len_sec=None):
@@ -16,7 +23,7 @@ class LibriCTCDataset(Dataset):
         self.resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=sample_rate)
         self.melspec = MelSpectrogram(sample_rate=sample_rate, n_mels=n_mels, n_fft=400, hop_length=160, f_min=20, f_max=7600)
         self.db = AmplitudeToDB(stype="power")
-        self.pcen_layer = PCEN(R=0.5, s=0.025, alpha=0.98, delta=2.0, eps=1e-6, trainable=True) if pcen else None
+        self.pcen_layer = PCEN(R=0.5, s=0.025, alpha=0.98, delta=2.0, eps=1e-6, trainable=True) if pcen and HAS_PCEN else None
         self.fmask = FrequencyMasking(freq_mask_param=18)
         self.tmask = TimeMasking(time_mask_param=50)
     def __len__(self): return len(self.ds)
