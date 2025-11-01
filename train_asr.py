@@ -13,7 +13,6 @@ from upgrades.beam_search_decoder import beam_search_decode
 from upgrades.data_parallel import setup_ddp
 from upgrades.beam_search_decoder_lm import KenLMDecoder
 
-
 def greedy_decode(logits, out_lens):
     preds = logits.argmax(dim=-1).cpu().tolist()
     outs = []
@@ -21,12 +20,10 @@ def greedy_decode(logits, out_lens):
         outs.append(preds[i][:L])
     return outs
 
-
 def ensure_dirs():
     os.makedirs("experiments/checkpoints", exist_ok=True)
     os.makedirs("experiments/plots", exist_ok=True)
     os.makedirs("experiments/logs", exist_ok=True)
-
 
 def run(args):
     ensure_dirs()
@@ -37,29 +34,25 @@ def run(args):
     vocab = ["<blk>"] + vocab
     encode, decode, stoi, itos, blank = build_text_tokenizer(vocab)
 
-    train = LibriCTCDataset(args.data_root, args.train_subset,
-        (encode, decode, stoi, itos, blank),
-        pcen=bool(args.pcen), tf_mixup=bool(args.tf_mixup),
-        specaug=bool(args.specaug),
-        max_len_sec=(args.max_len_sec if args.curriculum else None)
-    )
-    valid = LibriCTCDataset(args.data_root, args.valid_subset,
-        (encode, decode, stoi, itos, blank),
-        pcen=bool(args.pcen), specaug=False)
-    test = LibriCTCDataset(args.data_root, args.test_subset,
-        (encode, decode, stoi, itos, blank),
-        pcen=bool(args.pcen), specaug=False)
+    # Dataset loaders
+    train = LibriCTCDataset(args.data_root, args.train_subset, (encode, decode, stoi, itos, blank),
+                            pcen=bool(args.pcen), tf_mixup=bool(args.tf_mixup), specaug=bool(args.specaug),
+                            max_len_sec=(args.max_len_sec if args.curriculum else None))
+    valid = LibriCTCDataset(args.data_root, args.valid_subset, (encode, decode, stoi, itos, blank),
+                            pcen=bool(args.pcen), specaug=False)
+    test = LibriCTCDataset(args.data_root, args.test_subset, (encode, decode, stoi, itos, blank),
+                           pcen=bool(args.pcen), specaug=False)
 
     dl_train = DataLoader(train, batch_size=args.batch_size, shuffle=True, num_workers=4, collate_fn=ctc_collate, pin_memory=True)
     dl_valid = DataLoader(valid, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=ctc_collate)
     dl_test = DataLoader(test, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=ctc_collate)
 
-    model = CNNBiGRU(
-        n_mels=train.n_mels, vocab_size=len(vocab),
-        use_se=bool(args.use_se), cnn_channels=args.cnn_channels,
-        num_gru=args.num_gru, gru_hidden=args.gru_hidden, dropout=args.dropout)
+    # Model
+    model = CNNBiGRU(n_mels=train.n_mels, vocab_size=len(vocab), use_se=bool(args.use_se),
+                     cnn_channels=args.cnn_channels, num_gru=args.num_gru, gru_hidden=args.gru_hidden, dropout=args.dropout)
     model = setup_ddp(model).to(device)
 
+    # Optimizer + Scheduler
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.98), weight_decay=1e-4)
     ctc_loss = nn.CTCLoss(blank=blank, zero_infinity=True)
     ema = EMA(model, decay=0.999) if args.ema else None
@@ -73,63 +66,64 @@ def run(args):
         return 0.5 * (1 + math.cos(math.pi * p))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
-    # LM setup (KenLM optional)
+    # Language Model setup
     lm_decoder = None
     if args.use_lm and os.path.exists(args.lm_path):
-        print(f"Using KenLM: {args.lm_path}")
         lm_decoder = KenLMDecoder(args.lm_path, alpha=args.lm_alpha, beta=args.lm_beta,
                                   beam_width=args.beam_width, blank_idx=blank)
+        print(f"✅ Using KenLM from {args.lm_path}")
     else:
-        if args.use_lm:
-            print(f"LM path not found, skipping KenLM integration.")
+        print("⚠️ No valid KenLM found or disabled; running without LM fusion.")
 
     best_val = 1e9
     hist = {"train_loss": [], "val_loss": [], "wer": [], "cer": []}
     t0 = time.time()
     step = 0
 
+    # ============ Training ============
     for epoch in range(1, args.epochs+1):
         model.train()
         ep_loss = 0.0
         if args.curriculum:
             train.max_len_sec = None if epoch == args.epochs else args.max_len_sec
-        pbar = tqdm(dl_train, desc=f"Epoch {epoch}/{args.epochs}")
 
-        for x,x_lens,ys,y_lens in pbar:
-            x,x_lens,ys,y_lens = x.to(device),x_lens.to(device),ys.to(device),y_lens.to(device)
-            logits,out_lens = model(x,x_lens)
-            log_probs = F.log_softmax(logits,dim=-1).transpose(0,1)
+        pbar = tqdm(dl_train, desc=f"Epoch {epoch}/{args.epochs}")
+        for x, x_lens, ys, y_lens in pbar:
+            x, x_lens, ys, y_lens = x.to(device), x_lens.to(device), ys.to(device), y_lens.to(device)
+            logits, out_lens = model(x, x_lens)
+            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
             loss = ctc_loss(log_probs, ys, out_lens, y_lens)
+
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            opt.step()
-            sched.step()
+            opt.step(); sched.step()
             if ema: ema.update(model)
-            ep_loss += loss.item()
-            step += 1
+
+            ep_loss += loss.item(); step += 1
             pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{opt.param_groups[0]['lr']:.2e}")
 
-        train_loss = ep_loss/len(dl_train)
+        train_loss = ep_loss / len(dl_train)
         hist["train_loss"].append(train_loss)
 
-        # ----- validation -----
+        # ============ Validation ============
         model.eval()
         if ema: ema.apply_to(model)
         with torch.no_grad():
             val_loss, hyps, refs = 0.0, [], []
-            for x,x_lens,ys,y_lens in dl_valid:
-                x,x_lens,ys,y_lens = x.to(device),x_lens.to(device),ys.to(device),y_lens.to(device)
-                logits,out_lens = model(x,x_lens)
-                log_probs = F.log_softmax(logits,dim=-1).transpose(0,1)
+            for x, x_lens, ys, y_lens in dl_valid:
+                x, x_lens, ys, y_lens = x.to(device), x_lens.to(device), ys.to(device), y_lens.to(device)
+                logits, out_lens = model(x, x_lens)
+                log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
                 loss = ctc_loss(log_probs, ys, out_lens, y_lens)
                 val_loss += loss.item()
 
-                if args.beam and lm_decoder:
-                    pred_texts = lm_decoder.decode(logits, out_lens, vocab)
-                elif args.beam:
-                    pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
-                    pred_texts = [decode(s) for s in pred_ids]
+                if args.beam:
+                    if lm_decoder is not None:
+                        pred_texts = lm_decoder.decode(logits, out_lens, vocab)
+                    else:
+                        pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
+                        pred_texts = [decode(s) for s in pred_ids]
                 else:
                     pred_ids = greedy_decode(logits, out_lens)
                     pred_texts = [decode(s) for s in pred_ids]
@@ -140,10 +134,15 @@ def run(args):
                     ref = ys[ptr:ptr+L].cpu().tolist()
                     refs.append("".join([itos[i] for i in ref]).replace("|"," ").strip())
                     ptr += L
+
             val_loss /= len(dl_valid)
 
         if ema: ema.restore(model)
-        w,c = compute_metrics(refs,hyps) if (hyps and refs) else (float("nan"), float("nan"))
+        if hyps and refs:
+            w, c = compute_metrics(refs, hyps)
+        else:
+            w, c = float("nan"), float("nan")
+
         hist["val_loss"].append(val_loss); hist["wer"].append(w); hist["cer"].append(c)
         print(f"[Epoch {epoch}] train={train_loss:.3f} val={val_loss:.3f} WER={w:.3f} CER={c:.3f} time={human_time(time.time()-t0)}")
 
@@ -152,24 +151,25 @@ def run(args):
             torch.save({"model":model.state_dict(),"stoi":stoi,"itos":itos,"blank":blank},
                        "experiments/checkpoints/best_cnn_bigru_ctc.pt")
 
-    # ----- test -----
+    # ============ Final Test ============
     model.eval()
     if ema: ema.apply_to(model)
     with torch.no_grad():
         hyps, refs = [], []
         test_loss = 0.0
-        for x,x_lens,ys,y_lens in dl_test:
-            x,x_lens,ys,y_lens = x.to(device),x_lens.to(device),ys.to(device),y_lens.to(device)
-            logits,out_lens = model(x,x_lens)
-            log_probs = F.log_softmax(logits,dim=-1).transpose(0,1)
+        for x, x_lens, ys, y_lens in dl_test:
+            x, x_lens, ys, y_lens = x.to(device), x_lens.to(device), ys.to(device), y_lens.to(device)
+            logits, out_lens = model(x, x_lens)
+            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
             loss = ctc_loss(log_probs, ys, out_lens, y_lens)
             test_loss += loss.item()
 
-            if args.beam and lm_decoder:
-                pred_texts = lm_decoder.decode(logits, out_lens, vocab)
-            elif args.beam:
-                pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
-                pred_texts = [decode(s) for s in pred_ids]
+            if args.beam:
+                if lm_decoder is not None:
+                    pred_texts = lm_decoder.decode(logits, out_lens, vocab)
+                else:
+                    pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
+                    pred_texts = [decode(s) for s in pred_ids]
             else:
                 pred_ids = greedy_decode(logits, out_lens)
                 pred_texts = [decode(s) for s in pred_ids]
@@ -180,32 +180,18 @@ def run(args):
                 ref = ys[ptr:ptr+L].cpu().tolist()
                 refs.append("".join([itos[i] for i in ref]).replace("|"," ").strip())
                 ptr += L
+
         test_loss /= len(dl_test)
 
     if ema: ema.restore(model)
-    T_WER, T_CER = compute_metrics(refs, hyps) if (hyps and refs) else (float("nan"), float("nan"))
+    T_WER, T_CER = compute_metrics(refs, hyps) if hyps and refs else (float("nan"), float("nan"))
 
-    # plots
-    try:
-        plt.figure()
-        plt.plot(hist["train_loss"], label="train_loss")
-        plt.plot(hist["val_loss"], label="val_loss")
-        plt.legend(); plt.title("Loss"); plt.xlabel("Epoch"); plt.ylabel("Loss")
-        plt.savefig("experiments/plots/loss_curves.png"); plt.close()
-        plt.figure()
-        plt.plot(hist["wer"], label="val_WER")
-        plt.plot(hist["cer"], label="val_CER")
-        plt.legend(); plt.title("Validation Error Rates"); plt.xlabel("Epoch"); plt.ylabel("Error")
-        plt.savefig("experiments/plots/error_curves.png"); plt.close()
-    except Exception:
-        pass
-
-    with open("experiments/logs/sample_decodes.txt","w",encoding="utf-8") as f:
-        for h,r in list(zip(hyps,refs))[:50]:
-            f.write(f"HYP: {h}\nREF: {r}\n---\n")
+    # ============ Save metrics ============
+    lm_tag = "with_lm" if args.use_lm and lm_decoder else "no_lm"
+    summary_path = f"experiments/logs/run_summary_{lm_tag}.json"
 
     summary = {
-        "params_m": round(count_parameters(model)/1e6,3),
+        "params_m": round(count_parameters(model)/1e6, 3),
         "features": "PCEN" if bool(args.pcen) else "Log-Mel",
         "use_SE": bool(args.use_se),
         "tf_mixup": bool(args.tf_mixup),
@@ -213,7 +199,7 @@ def run(args):
         "ema": bool(args.ema),
         "beam": bool(args.beam),
         "use_lm": bool(args.use_lm),
-        "lm_path": args.lm_path,
+        "lm_path": args.lm_path if args.use_lm else "",
         "lm_alpha": args.lm_alpha,
         "lm_beta": args.lm_beta,
         "epochs": args.epochs,
@@ -222,11 +208,9 @@ def run(args):
         "test_WER": float(T_WER),
         "test_CER": float(T_CER)
     }
-
-    summary_file = "run_summary_with_lm.json" if args.use_lm else "run_summary_no_lm.json"
-    with open(os.path.join("experiments/logs", summary_file), "w") as f:
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-
+    print(f"✅ Saved results to {summary_path}")
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -257,7 +241,6 @@ def parse_args():
     ap.add_argument("--lm_beta", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
-
 
 if __name__ == "__main__":
     args = parse_args()
