@@ -1,7 +1,8 @@
-torch>=2.2.0
-torchaudio>=2.2.0
-torchmetrics
+torch
+torchaudio
+tqdm
 numpy
 matplotlib
-tqdm
-jiwer
+editdistance
+datasets
+kenlm

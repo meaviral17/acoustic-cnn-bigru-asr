@@ -1,4 +1,3 @@
-import os
 import torch
 
 def setup_ddp(model):
