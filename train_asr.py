@@ -8,8 +8,9 @@ from data import LibriCTCDataset, ctc_collate
 from utils import seed_everything, get_device, count_parameters, human_time, build_text_tokenizer
 from utils.ema import EMA
 from utils.metrics import compute_metrics
-from optional_upgrades.beam_search_decoder import beam_search_decode
-from optional_upgrades.data_parallel import setup_ddp
+from upgrades.beam_search_decoder import beam_search_decode
+from upgrades.data_parallel import setup_ddp
+from upgrades.external_lm import ExternalLM
 
 def greedy_decode(logits, out_lens):
     preds = logits.argmax(dim=-1).cpu().tolist()
@@ -49,6 +50,8 @@ def run(args):
         p = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * p))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    lm_path = args.lm_path if os.path.exists(args.lm_path) else ("lm/english.arpa" if os.path.exists("lm/english.arpa") else None)
+    lm = ExternalLM(path=lm_path, alpha=args.lm_alpha, beta=args.lm_beta) if (args.beam and args.use_lm and lm_path) else None
     best_val = 1e9
     hist = {"train_loss": [], "val_loss": [], "wer": [], "cer": []}
     t0 = time.time()
@@ -86,7 +89,7 @@ def run(args):
                 loss = ctc_loss(log_probs, ys, out_lens, y_lens)
                 val_loss += loss.item()
                 if args.beam:
-                    pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
+                    pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width, lm=lm)
                 else:
                     pred_ids = greedy_decode(logits, out_lens)
                 for seq in pred_ids[:3]:
@@ -119,7 +122,7 @@ def run(args):
             loss = ctc_loss(log_probs, ys, out_lens, y_lens)
             test_loss += loss.item()
             if args.beam:
-                pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width)
+                pred_ids = beam_search_decode(logits, out_lens, blank, beam_width=args.beam_width, lm=lm)
             else:
                 pred_ids = greedy_decode(logits, out_lens)
             hyps += [decode(s) for s in pred_ids]
@@ -135,7 +138,6 @@ def run(args):
     else:
         T_WER, T_CER = float("nan"), float("nan")
     try:
-        import matplotlib
         plt.figure()
         plt.plot(hist["train_loss"], label="train_loss")
         plt.plot(hist["val_loss"], label="val_loss")
@@ -146,7 +148,7 @@ def run(args):
         plt.plot(hist["cer"], label="val_CER")
         plt.legend(); plt.title("Validation Error Rates"); plt.xlabel("Epoch"); plt.ylabel("Error")
         plt.savefig("experiments/plots/error_curves.png"); plt.close()
-    except Exception as e:
+    except Exception:
         pass
     with open("experiments/logs/sample_decodes.txt","w",encoding="utf-8") as f:
         for h,r in list(zip(hyps,refs))[:50]:
@@ -159,6 +161,10 @@ def run(args):
         "curriculum": bool(args.curriculum),
         "ema": bool(args.ema),
         "beam": bool(args.beam),
+        "use_lm": bool(args.use_lm),
+        "lm_path": lm_path if lm_path else "",
+        "lm_alpha": args.lm_alpha,
+        "lm_beta": args.lm_beta,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "test_loss": float(test_loss),
@@ -191,6 +197,10 @@ def parse_args():
     ap.add_argument("--ema", type=int, default=1)
     ap.add_argument("--beam", type=int, default=0)
     ap.add_argument("--beam_width", type=int, default=10)
+    ap.add_argument("--use_lm", type=int, default=1)
+    ap.add_argument("--lm_path", type=str, default="lm/english.binary")
+    ap.add_argument("--lm_alpha", type=float, default=0.6)
+    ap.add_argument("--lm_beta", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
 
